@@ -1,16 +1,55 @@
 import React, { useRef, useState, useEffect } from 'react';
 import io from 'socket.io-client';
+import { GOOGLE_DRIVE_CONFIG } from './config';
 
 export default function App() {
   const [mode, setMode] = useState(null); // 'send' or 'receive'
   const [room, setRoom] = useState('');
   const [fileName, setFileName] = useState('');
+  const [isGoogleDriveEnabled, setIsGoogleDriveEnabled] = useState(false);
+  const [googleDriveLink, setGoogleDriveLink] = useState('');
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [isUploading, setIsUploading] = useState(false);
+  const [p2pTimeout, setP2pTimeout] = useState(null);
+  const [accessToken, setAccessToken] = useState(null);
   const fileRef = useRef();
   const pcRef = useRef(null);
   const dataChannelRef = useRef(null);
   const socket = useRef(null);
+  const tokenClientRef = useRef(null);
 
   const SIGNALING_SERVER = 'http://13.233.212.34:3000';
+
+  // Initialize Google Identity Services token client
+  useEffect(() => {
+    const initTokenClient = () => {
+      if (window.google && window.google.accounts && window.google.accounts.oauth2) {
+        tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
+          client_id: GOOGLE_DRIVE_CONFIG.CLIENT_ID,
+          scope: GOOGLE_DRIVE_CONFIG.SCOPES,
+          prompt: '',
+          callback: (tokenResponse) => {
+            if (tokenResponse && tokenResponse.access_token) {
+              setAccessToken(tokenResponse.access_token);
+              setIsGoogleDriveEnabled(true);
+            }
+          }
+        });
+      }
+    };
+
+    if (window.google && window.google.accounts && window.google.accounts.oauth2) {
+      initTokenClient();
+    } else {
+      const interval = setInterval(() => {
+        if (window.google && window.google.accounts && window.google.accounts.oauth2) {
+          clearInterval(interval);
+          initTokenClient();
+        }
+      }, 100);
+      return () => clearInterval(interval);
+    }
+  }, []);
 
   useEffect(() => {
     socket.current = io(SIGNALING_SERVER);
@@ -101,6 +140,22 @@ export default function App() {
 
     pcRef.current.onconnectionstatechange = () => {
       console.log('Connection state:', pcRef.current.connectionState);
+      
+      // Check for P2P connection failure
+      if (pcRef.current.connectionState === 'failed' || pcRef.current.connectionState === 'disconnected') {
+        console.log('P2P connection failed, attempting Google Drive upload...');
+        if (mode === 'send' && fileRef.current?.files[0]) {
+          uploadToGoogleDrive(fileRef.current.files[0]);
+        }
+      }
+      
+      // Clear timeout if connection is successful
+      if (pcRef.current.connectionState === 'connected') {
+        if (p2pTimeout) {
+          clearTimeout(p2pTimeout);
+          setP2pTimeout(null);
+        }
+      }
     };
   };
 
@@ -178,6 +233,92 @@ export default function App() {
     readSlice(0);
   };
 
+  // Google Drive auth via Google Identity Services
+  const authenticateGoogleDrive = async () => {
+    try {
+      if (!tokenClientRef.current) {
+        throw new Error('Google Identity Services not loaded');
+      }
+
+      return await new Promise((resolve) => {
+        tokenClientRef.current.callback = (tokenResponse) => {
+          if (tokenResponse && tokenResponse.access_token) {
+            setAccessToken(tokenResponse.access_token);
+            setIsGoogleDriveEnabled(true);
+            resolve(true);
+          } else {
+            resolve(false);
+          }
+        };
+        tokenClientRef.current.requestAccessToken({ prompt: 'consent' });
+      });
+    } catch (error) {
+      console.error('Google Drive authentication failed:', error);
+      alert('Failed to authenticate with Google Drive. Please try again.');
+      return false;
+    }
+  };
+
+  const uploadToGoogleDrive = async (file) => {
+    if (!accessToken) {
+      const ok = await authenticateGoogleDrive();
+      if (!ok) return;
+    }
+
+    setIsUploading(true);
+    setUploadProgress(0);
+
+    try {
+      const metadata = {
+        name: file.name,
+        parents: [] // Upload to root folder
+      };
+
+      const form = new FormData();
+      form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+      form.append('file', file);
+
+      const xhr = new XMLHttpRequest();
+      
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+          const progress = Math.round((e.loaded / e.total) * 100);
+          setUploadProgress(progress);
+        }
+      });
+
+      xhr.onload = () => {
+        if (xhr.status === 200) {
+          const response = JSON.parse(xhr.responseText);
+          const fileId = response.id;
+          const shareLink = `https://drive.google.com/file/d/${fileId}/view`;
+          setGoogleDriveLink(shareLink);
+          console.log('File uploaded to Google Drive:', shareLink);
+          alert(`File uploaded successfully! Share this link: ${shareLink}`);
+        } else {
+          console.error('Upload failed:', xhr.responseText);
+          alert('Upload to Google Drive failed. Please try again.');
+        }
+        setIsUploading(false);
+      };
+
+      xhr.onerror = () => {
+        console.error('Upload error');
+        alert('Upload to Google Drive failed. Please try again.');
+        setIsUploading(false);
+      };
+
+      xhr.open('POST', 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart');
+      xhr.setRequestHeader('Authorization', `Bearer ${accessToken}`);
+      xhr.send(form);
+
+    } catch (error) {
+      console.error('Google Drive upload error:', error);
+      alert('Upload to Google Drive failed. Please try again.');
+      setIsUploading(false);
+    }
+  };
+
   const startSend = () => {
     if (!fileRef.current?.files[0]) return alert('Select a file first!');
     const file = fileRef.current.files[0];
@@ -186,6 +327,16 @@ export default function App() {
     const roomCode = Math.random().toString(36).substr(2, 4).toUpperCase();
     setRoom(roomCode);
     joinRoom(roomCode, file, true);
+    
+    // Set a timeout for P2P connection (30 seconds)
+    const timeout = setTimeout(() => {
+      console.log('P2P connection timeout, attempting Google Drive upload...');
+      if (pcRef.current?.connectionState !== 'connected') {
+        uploadToGoogleDrive(file);
+      }
+    }, 30000);
+    
+    setP2pTimeout(timeout);
   };
 
   const startReceive = () => {
@@ -206,8 +357,43 @@ export default function App() {
       ) : mode === 'send' ? (
         <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:'10px', marginTop:'20px' }}>
           <input type="file" ref={fileRef} />
-          <button style={buttonStyle} onClick={startSend}>Start Sending</button>
+          <div style={{ display:'flex', gap:'10px', flexWrap:'wrap', justifyContent:'center' }}>
+            <button style={buttonStyle} onClick={startSend}>Start P2P Transfer</button>
+            <button style={{...buttonStyle, backgroundColor: '#34a853'}} onClick={() => fileRef.current?.files[0] && uploadToGoogleDrive(fileRef.current.files[0])}>
+              Upload to Google Drive
+            </button>
+            <button style={{...buttonStyle, backgroundColor: '#ea4335'}} onClick={authenticateGoogleDrive}>
+              {isGoogleDriveEnabled ? '✓ Authenticated' : 'Authenticate Google Drive'}
+            </button>
+          </div>
           {room && <p>Share this code with receiver: <b>{room}</b></p>}
+          {isUploading && (
+            <div style={{ width: '300px', textAlign: 'center' }}>
+              <p>Uploading to Google Drive... {uploadProgress}%</p>
+              <div style={{ width: '100%', backgroundColor: '#f0f0f0', borderRadius: '4px', height: '20px' }}>
+                <div style={{ width: `${uploadProgress}%`, backgroundColor: '#34a853', height: '100%', borderRadius: '4px', transition: 'width 0.3s' }}></div>
+              </div>
+            </div>
+          )}
+          {googleDriveLink && (
+            <div style={{ textAlign: 'center', maxWidth: '400px' }}>
+              <p style={{ color: '#34a853', fontWeight: 'bold' }}>Google Drive Link:</p>
+              <a href={googleDriveLink} target="_blank" rel="noopener noreferrer" style={{ color: '#1a73e8', wordBreak: 'break-all' }}>
+                {googleDriveLink}
+              </a>
+              <button 
+                style={{...buttonStyle, backgroundColor: '#1a73e8', marginTop: '10px'}} 
+                onClick={() => navigator.clipboard.writeText(googleDriveLink)}
+              >
+                Copy Link
+              </button>
+            </div>
+          )}
+          <div style={{ textAlign: 'center', marginTop: '10px' }}>
+            <p style={{ fontSize: '14px', color: isGoogleDriveEnabled ? '#34a853' : '#ea4335' }}>
+              Google Drive: {isGoogleDriveEnabled ? '✓ Ready' : '❌ Not authenticated'}
+            </p>
+          </div>
         </div>
       ) : (
         <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:'10px', marginTop:'20px' }}>
