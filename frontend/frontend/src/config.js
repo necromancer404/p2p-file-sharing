@@ -1,17 +1,8 @@
-// Google Drive API Configuration
-// Replace these with your actual Google Drive API credentials
+// Vite env (set in Vercel Project → Settings → Environment Variables)
+// VITE_SIGNALING_SERVER — WebSocket signaling host (e.g. https://your-api.railway.app or http://EC2:3000)
+// VITE_UPLOADCARE_PUBLIC_KEY — Uploadcare public key (dashboard → API keys)
 
-export const GOOGLE_DRIVE_CONFIG = {
-  CLIENT_ID: '252499620125-tscdg1v9nu02gl41gqngfjcdp4e9hb1q.apps.googleusercontent.com',
-  API_KEY: 'AIzaSyAsu1QzlIQWAwP5hwu3E4waFNjoY6sLhFk',
-  DISCOVERY_DOCS: ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'],
-  SCOPES: 'https://www.googleapis.com/auth/drive.file'
+export const APP_CONFIG = {
+  SIGNALING_SERVER: import.meta.env.VITE_SIGNALING_SERVER || 'http://localhost:3000',
+  UPLOADCARE_PUBLIC_KEY: import.meta.env.VITE_UPLOADCARE_PUBLIC_KEY || '22ae90c600fbfb5eb2db',
 };
-
-// Instructions for setting up Google Drive API:
-// 1. Go to https://console.developers.google.com/
-// 2. Create a new project or select an existing one
-// 3. Enable the Google Drive API
-// 4. Create credentials (OAuth 2.0 Client ID for web application)
-// 5. Add your domain to authorized origins
-// 6. Copy the Client ID and API Key to this file

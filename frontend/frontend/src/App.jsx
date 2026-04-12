@@ -1,55 +1,65 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect, useCallback } from 'react';
 import io from 'socket.io-client';
-import { GOOGLE_DRIVE_CONFIG } from './config';
+import { uploadFile } from '@uploadcare/upload-client';
+import { APP_CONFIG } from './config';
+import './App.css';
+
+const SIGNALING_SERVER = APP_CONFIG.SIGNALING_SERVER || 'http://localhost:3000';
+const UPLOADCARE_KEY = APP_CONFIG.UPLOADCARE_PUBLIC_KEY;
 
 export default function App() {
-  const [mode, setMode] = useState(null); // 'send' or 'receive'
+  const [mode, setMode] = useState(null);
   const [room, setRoom] = useState('');
   const [fileName, setFileName] = useState('');
-  const [isGoogleDriveEnabled, setIsGoogleDriveEnabled] = useState(false);
-  const [googleDriveLink, setGoogleDriveLink] = useState('');
+  const [cloudLink, setCloudLink] = useState('');
   const [uploadProgress, setUploadProgress] = useState(0);
   const [isUploading, setIsUploading] = useState(false);
-  const [p2pTimeout, setP2pTimeout] = useState(null);
-  const [accessToken, setAccessToken] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [hasFile, setHasFile] = useState(false);
   const fileRef = useRef();
   const pcRef = useRef(null);
   const dataChannelRef = useRef(null);
   const socket = useRef(null);
-  const tokenClientRef = useRef(null);
+  const modeRef = useRef(mode);
+  const p2pTimeoutRef = useRef(null);
 
-  const SIGNALING_SERVER = 'http://13.233.212.34:3000';
-
-  // Initialize Google Identity Services token client
   useEffect(() => {
-    const initTokenClient = () => {
-      if (window.google && window.google.accounts && window.google.accounts.oauth2) {
-        tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
-          client_id: GOOGLE_DRIVE_CONFIG.CLIENT_ID,
-          scope: GOOGLE_DRIVE_CONFIG.SCOPES,
-          prompt: '',
-          callback: (tokenResponse) => {
-            if (tokenResponse && tokenResponse.access_token) {
-              setAccessToken(tokenResponse.access_token);
-              setIsGoogleDriveEnabled(true);
-            }
-          }
-        });
-      }
-    };
+    modeRef.current = mode;
+  }, [mode]);
 
-    if (window.google && window.google.accounts && window.google.accounts.oauth2) {
-      initTokenClient();
-    } else {
-      const interval = setInterval(() => {
-        if (window.google && window.google.accounts && window.google.accounts.oauth2) {
-          clearInterval(interval);
-          initTokenClient();
-        }
-      }, 100);
-      return () => clearInterval(interval);
-    }
+  const showToast = useCallback((type, message) => {
+    setToast({ type, message });
   }, []);
+
+  const clearSession = useCallback(() => {
+    if (p2pTimeoutRef.current) {
+      clearTimeout(p2pTimeoutRef.current);
+      p2pTimeoutRef.current = null;
+    }
+    if (pcRef.current) {
+      try {
+        pcRef.current.close();
+      } catch {
+        /* ignore */
+      }
+      pcRef.current = null;
+    }
+    dataChannelRef.current = null;
+    if (fileRef.current) fileRef.current.value = '';
+    setRoom('');
+    setFileName('');
+    setCloudLink('');
+    setUploadProgress(0);
+    setIsUploading(false);
+    setToast(null);
+    setHasFile(false);
+  }, []);
+
+  const goHome = () => {
+    clearSession();
+    setMode(null);
+  };
 
   useEffect(() => {
     socket.current = io(SIGNALING_SERVER);
@@ -63,13 +73,12 @@ export default function App() {
     });
 
     socket.current.on('ready', (peerId) => {
+      const m = modeRef.current;
       console.log('Peer ready:', peerId);
-      // If sender, create offer when receiver joins
-      if (mode === 'send' && fileRef.current?.files[0]) {
+      if (m === 'send' && fileRef.current?.files[0]) {
         createOffer(peerId);
       }
-      // If receiver, wait for offer (no action needed here)
-      if (mode === 'receive') {
+      if (m === 'receive') {
         console.log('Waiting for offer from sender...');
       }
     });
@@ -98,22 +107,61 @@ export default function App() {
 
     socket.current.on('ice-candidate', async ({ candidate }) => {
       console.log('Received ICE candidate');
-      try { 
-        await pcRef.current.addIceCandidate(candidate); 
-      } catch (e) { 
-        console.error('Error adding ICE candidate:', e); 
+      try {
+        await pcRef.current.addIceCandidate(candidate);
+      } catch (e) {
+        console.error('Error adding ICE candidate:', e);
       }
     });
 
     return () => socket.current.disconnect();
-  }, [mode]);
+  }, []);
+
+  const uploadToUploadcare = async (file) => {
+    if (!UPLOADCARE_KEY) {
+      showToast(
+        'error',
+        'Add VITE_UPLOADCARE_PUBLIC_KEY in Vercel (or .env.local) to enable cloud fallback uploads.'
+      );
+      return;
+    }
+
+    setIsUploading(true);
+    setUploadProgress(0);
+    setCloudLink('');
+    setToast(null);
+
+    try {
+      const result = await uploadFile(file, {
+        publicKey: UPLOADCARE_KEY,
+        store: 'auto',
+        fileName: file.name,
+        contentType: file.type || undefined,
+        onProgress: (info) => {
+          if (info.isComputable) {
+            setUploadProgress(Math.round(info.value * 100));
+          }
+        },
+      });
+
+      const url = result.cdnUrl;
+      setCloudLink(url);
+      showToast('ok', 'File is on Uploadcare. Share the link below.');
+      console.log('Uploadcare URL:', url);
+    } catch (error) {
+      console.error('Uploadcare upload error:', error);
+      showToast('error', error.message || 'Upload to Uploadcare failed.');
+    } finally {
+      setIsUploading(false);
+    }
+  };
 
   const joinRoom = (roomId, file = null, isSender = false) => {
     console.log(`Joining room ${roomId} as ${isSender ? 'sender' : 'receiver'}`);
     socket.current.emit('join', roomId);
 
     pcRef.current = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
     });
 
     if (isSender) {
@@ -132,29 +180,24 @@ export default function App() {
     pcRef.current.onicecandidate = (e) => {
       if (e.candidate) {
         console.log('Sending ICE candidate');
-        // For ICE candidates, we need to send to all peers in the room
-        // The server will handle broadcasting to other peers
         socket.current.emit('ice-candidate', { candidate: e.candidate, room: roomId });
       }
     };
 
     pcRef.current.onconnectionstatechange = () => {
-      console.log('Connection state:', pcRef.current.connectionState);
-      
-      // Check for P2P connection failure
-      if (pcRef.current.connectionState === 'failed' || pcRef.current.connectionState === 'disconnected') {
-        console.log('P2P connection failed, attempting Google Drive upload...');
-        if (mode === 'send' && fileRef.current?.files[0]) {
-          uploadToGoogleDrive(fileRef.current.files[0]);
+      const state = pcRef.current?.connectionState;
+      console.log('Connection state:', state);
+
+      if (state === 'failed' || state === 'disconnected') {
+        console.log('P2P connection issue, attempting Uploadcare upload...');
+        if (modeRef.current === 'send' && fileRef.current?.files[0]) {
+          uploadToUploadcare(fileRef.current.files[0]);
         }
       }
-      
-      // Clear timeout if connection is successful
-      if (pcRef.current.connectionState === 'connected') {
-        if (p2pTimeout) {
-          clearTimeout(p2pTimeout);
-          setP2pTimeout(null);
-        }
+
+      if (state === 'connected' && p2pTimeoutRef.current) {
+        clearTimeout(p2pTimeoutRef.current);
+        p2pTimeoutRef.current = null;
       }
     };
   };
@@ -167,13 +210,16 @@ export default function App() {
 
   const setupDataChannel = (file) => {
     const ch = dataChannelRef.current;
-    let buffers = [], expected = 0, size = 0, receivedFileName = '';
+    let buffers = [];
+    let expected = 0;
+    let size = 0;
+    let receivedFileName = '';
 
-    ch.onopen = () => { 
+    ch.onopen = () => {
       console.log('Data channel opened');
       if (file) {
         console.log('Sending file:', file.name, 'Size:', file.size);
-        sendFile(file); 
+        sendFile(file);
       }
     };
 
@@ -188,7 +234,6 @@ export default function App() {
           console.log('Expected file size:', expected, 'Filename:', receivedFileName);
         }
       } else {
-        // Handle binary data - check for byteLength property
         const dataSize = e.data.byteLength || e.data.size || 0;
         console.log('Received binary data, size:', dataSize, 'Total received:', size + dataSize, 'Expected:', expected);
         buffers.push(e.data);
@@ -203,7 +248,10 @@ export default function App() {
           a.click();
           a.remove();
           console.log('File downloaded:', a.download);
-          buffers = []; size = 0; expected = 0;
+          showToast('ok', 'Peer transfer complete. Download started.');
+          buffers = [];
+          size = 0;
+          expected = 0;
         }
       }
     };
@@ -233,183 +281,256 @@ export default function App() {
     readSlice(0);
   };
 
-  // Google Drive auth via Google Identity Services
-  const authenticateGoogleDrive = async () => {
-    try {
-      if (!tokenClientRef.current) {
-        throw new Error('Google Identity Services not loaded');
-      }
-
-      return await new Promise((resolve) => {
-        tokenClientRef.current.callback = (tokenResponse) => {
-          if (tokenResponse && tokenResponse.access_token) {
-            setAccessToken(tokenResponse.access_token);
-            setIsGoogleDriveEnabled(true);
-            resolve(true);
-          } else {
-            resolve(false);
-          }
-        };
-        tokenClientRef.current.requestAccessToken({ prompt: 'consent' });
-      });
-    } catch (error) {
-      console.error('Google Drive authentication failed:', error);
-      alert('Failed to authenticate with Google Drive. Please try again.');
-      return false;
-    }
-  };
-
-  const uploadToGoogleDrive = async (file) => {
-    if (!accessToken) {
-      const ok = await authenticateGoogleDrive();
-      if (!ok) return;
-    }
-
-    setIsUploading(true);
-    setUploadProgress(0);
-
-    try {
-      const metadata = {
-        name: file.name,
-        parents: [] // Upload to root folder
-      };
-
-      const form = new FormData();
-      form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
-      form.append('file', file);
-
-      const xhr = new XMLHttpRequest();
-      
-      xhr.upload.addEventListener('progress', (e) => {
-        if (e.lengthComputable) {
-          const progress = Math.round((e.loaded / e.total) * 100);
-          setUploadProgress(progress);
-        }
-      });
-
-      xhr.onload = () => {
-        if (xhr.status === 200) {
-          const response = JSON.parse(xhr.responseText);
-          const fileId = response.id;
-          const shareLink = `https://drive.google.com/file/d/${fileId}/view`;
-          setGoogleDriveLink(shareLink);
-          console.log('File uploaded to Google Drive:', shareLink);
-          alert(`File uploaded successfully! Share this link: ${shareLink}`);
-        } else {
-          console.error('Upload failed:', xhr.responseText);
-          alert('Upload to Google Drive failed. Please try again.');
-        }
-        setIsUploading(false);
-      };
-
-      xhr.onerror = () => {
-        console.error('Upload error');
-        alert('Upload to Google Drive failed. Please try again.');
-        setIsUploading(false);
-      };
-
-      xhr.open('POST', 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart');
-      xhr.setRequestHeader('Authorization', `Bearer ${accessToken}`);
-      xhr.send(form);
-
-    } catch (error) {
-      console.error('Google Drive upload error:', error);
-      alert('Upload to Google Drive failed. Please try again.');
-      setIsUploading(false);
-    }
-  };
-
   const startSend = () => {
-    if (!fileRef.current?.files[0]) return alert('Select a file first!');
+    if (!fileRef.current?.files[0]) {
+      showToast('error', 'Choose a file first.');
+      return;
+    }
     const file = fileRef.current.files[0];
     setFileName(file.name);
 
     const roomCode = Math.random().toString(36).substr(2, 4).toUpperCase();
     setRoom(roomCode);
     joinRoom(roomCode, file, true);
-    
-    // Set a timeout for P2P connection (30 seconds)
-    const timeout = setTimeout(() => {
-      console.log('P2P connection timeout, attempting Google Drive upload...');
+
+    p2pTimeoutRef.current = setTimeout(() => {
+      console.log('P2P connection timeout, attempting Uploadcare upload...');
       if (pcRef.current?.connectionState !== 'connected') {
-        uploadToGoogleDrive(file);
+        uploadToUploadcare(file);
       }
+      p2pTimeoutRef.current = null;
     }, 30000);
-    
-    setP2pTimeout(timeout);
   };
 
   const startReceive = () => {
-    if (!room) return alert('Enter room code!');
+    if (!room) {
+      showToast('error', 'Enter the four-letter room code.');
+      return;
+    }
     setMode('receive');
     joinRoom(room, null, false);
   };
 
-  return (
-    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'100vh', fontFamily:'Arial, sans-serif', backgroundColor:'#f7f7f7', color:'#333', padding:'20px' }}>
-      <h1 style={{ fontWeight: 300 }}>P2P File Transfer</h1>
+  const pickFile = (fileList) => {
+    if (!fileList?.length) return;
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(fileList[0]);
+    fileRef.current.files = dataTransfer.files;
+    setFileName(fileList[0].name);
+    setHasFile(true);
+    setToast(null);
+  };
 
-      {!mode ? (
-        <div style={{ display:'flex', gap:'20px', marginTop:'20px' }}>
-          <button style={buttonStyle} onClick={() => setMode('send')}>Send</button>
-          <button style={buttonStyle} onClick={() => setMode('receive')}>Receive</button>
-        </div>
-      ) : mode === 'send' ? (
-        <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:'10px', marginTop:'20px' }}>
-          <input type="file" ref={fileRef} />
-          <div style={{ display:'flex', gap:'10px', flexWrap:'wrap', justifyContent:'center' }}>
-            <button style={buttonStyle} onClick={startSend}>Start P2P Transfer</button>
-            <button style={{...buttonStyle, backgroundColor: '#34a853'}} onClick={() => fileRef.current?.files[0] && uploadToGoogleDrive(fileRef.current.files[0])}>
-              Upload to Google Drive
-            </button>
-            <button style={{...buttonStyle, backgroundColor: '#ea4335'}} onClick={authenticateGoogleDrive}>
-              {isGoogleDriveEnabled ? '✓ Authenticated' : 'Authenticate Google Drive'}
-            </button>
-          </div>
-          {room && <p>Share this code with receiver: <b>{room}</b></p>}
-          {isUploading && (
-            <div style={{ width: '300px', textAlign: 'center' }}>
-              <p>Uploading to Google Drive... {uploadProgress}%</p>
-              <div style={{ width: '100%', backgroundColor: '#f0f0f0', borderRadius: '4px', height: '20px' }}>
-                <div style={{ width: `${uploadProgress}%`, backgroundColor: '#34a853', height: '100%', borderRadius: '4px', transition: 'width 0.3s' }}></div>
-              </div>
+  const onDrop = (e) => {
+    e.preventDefault();
+    setDragOver(false);
+    pickFile(e.dataTransfer.files);
+  };
+
+  const IconSend = () => (
+    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M12 3v12m0 0l4-4m-4 4l-4-4M5 21h14"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+
+  const IconReceive = () => (
+    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M12 21V9m0 0l4 4m-4-4l-4 4M5 3h14"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+
+  const IconLogo = () => (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M7 12h10M12 7v10"
+        stroke="#0c0a12"
+        strokeWidth="2.2"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+
+  return (
+    <div className="app-root">
+      <div className="app-bg" aria-hidden />
+      <div className="app-grid" aria-hidden />
+      <div className="app-noise" aria-hidden />
+      <div className="app-shell">
+        <div className="app-card">
+          <div className="brand">
+            <div className="brand-mark">
+              <IconLogo />
             </div>
-          )}
-          {googleDriveLink && (
-            <div style={{ textAlign: 'center', maxWidth: '400px' }}>
-              <p style={{ color: '#34a853', fontWeight: 'bold' }}>Google Drive Link:</p>
-              <a href={googleDriveLink} target="_blank" rel="noopener noreferrer" style={{ color: '#1a73e8', wordBreak: 'break-all' }}>
-                {googleDriveLink}
-              </a>
-              <button 
-                style={{...buttonStyle, backgroundColor: '#1a73e8', marginTop: '10px'}} 
-                onClick={() => navigator.clipboard.writeText(googleDriveLink)}
-              >
-                Copy Link
+            <div>
+              <h1>Aurora Beam</h1>
+            </div>
+          </div>
+          <p className="tagline">
+            WebRTC peer transfer with an Uploadcare safety net when the direct path does not come up.
+          </p>
+
+          <div className="pills">
+            <span className="pill pill-accent">WebRTC data channel</span>
+            <span className="pill">Uploadcare cloud</span>
+            <span className="pill">Room codes</span>
+          </div>
+
+          {!mode ? (
+            <div className="mode-grid">
+              <button type="button" className="mode-tile" onClick={() => setMode('send')}>
+                <IconSend />
+                <h2>Send</h2>
+                <p>Open a room, share the code, and push bytes straight to your peer.</p>
+              </button>
+              <button type="button" className="mode-tile" onClick={() => setMode('receive')}>
+                <IconReceive />
+                <h2>Receive</h2>
+                <p>Enter the code you were given and accept the incoming file.</p>
               </button>
             </div>
+          ) : mode === 'send' ? (
+            <>
+              <div className="back-row">
+                <button type="button" className="btn btn-ghost" onClick={goHome}>
+                  ← Back
+                </button>
+              </div>
+              <label
+                className={`dropzone ${dragOver ? 'drag' : ''}`}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setDragOver(true);
+                }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={onDrop}
+              >
+                <input
+                  type="file"
+                  ref={fileRef}
+                  onChange={(e) => pickFile(e.target.files)}
+                />
+                <strong>Drop a file or tap to browse</strong>
+                <span>Anything your browser can read — we keep the UI local until transfer.</span>
+              </label>
+              {fileName ? (
+                <div className="file-chip" title={fileName}>
+                  <span aria-hidden>📎</span>
+                  {fileName}
+                </div>
+              ) : null}
+
+              <div className="panel-actions">
+                <button type="button" className="btn btn-primary" onClick={startSend}>
+                  Start peer transfer
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  disabled={!hasFile || isUploading}
+                  onClick={() => fileRef.current?.files[0] && uploadToUploadcare(fileRef.current.files[0])}
+                >
+                  Upload to Uploadcare
+                </button>
+              </div>
+
+              {room ? (
+                <div className="room-code-display">
+                  <div className="label">Room code</div>
+                  <p className="code">{room}</p>
+                </div>
+              ) : null}
+
+              {isUploading ? (
+                <div className="progress-wrap">
+                  <div className="progress-label">
+                    <span>Uploading with Uploadcare</span>
+                    <span>{uploadProgress}%</span>
+                  </div>
+                  <div className="progress-track">
+                    <div className="progress-fill" style={{ width: `${uploadProgress}%` }} />
+                  </div>
+                </div>
+              ) : null}
+
+              {cloudLink ? (
+                <div className="link-box">
+                  <div className="progress-label" style={{ marginBottom: 8 }}>
+                    <span>CDN link</span>
+                  </div>
+                  <a href={cloudLink} target="_blank" rel="noopener noreferrer">
+                    {cloudLink}
+                  </a>
+                  <div className="panel-actions" style={{ marginTop: 12 }}>
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      onClick={() => {
+                        navigator.clipboard.writeText(cloudLink);
+                        showToast('ok', 'Link copied to clipboard.');
+                      }}
+                    >
+                      Copy link
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
+              <p className="hint">
+                If the peer route stalls ~30s or ICE fails, we automatically try Uploadcare (when your public key is
+                configured).
+              </p>
+            </>
+          ) : (
+            <>
+              <div className="back-row">
+                <button type="button" className="btn btn-ghost" onClick={goHome}>
+                  ← Back
+                </button>
+              </div>
+              <div className="room-field">
+                <input
+                  type="text"
+                  placeholder="CODE"
+                  value={room}
+                  onChange={(e) => setRoom(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4))}
+                  maxLength={4}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <button type="button" className="btn btn-primary" onClick={startReceive}>
+                  Join & receive
+                </button>
+              </div>
+              <p className="hint">Ask the sender for the glowing four-character code, then join once they started.</p>
+            </>
           )}
-          <div style={{ textAlign: 'center', marginTop: '10px' }}>
-            <p style={{ fontSize: '14px', color: isGoogleDriveEnabled ? '#34a853' : '#ea4335' }}>
-              Google Drive: {isGoogleDriveEnabled ? '✓ Ready' : '❌ Not authenticated'}
-            </p>
-          </div>
+
+          {toast ? (
+            <div className={`toast toast-${toast.type === 'error' ? 'error' : toast.type === 'warn' ? 'warn' : 'ok'}`}>
+              {toast.message}
+            </div>
+          ) : null}
+
+          {!UPLOADCARE_KEY ? (
+            <div className="toast toast-warn" style={{ marginTop: 12 }}>
+              Cloud fallback is paused: set <code style={{ color: '#fff' }}>VITE_UPLOADCARE_PUBLIC_KEY</code> for
+              Vercel builds.
+            </div>
+          ) : null}
         </div>
-      ) : (
-        <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:'10px', marginTop:'20px' }}>
-          <input type="text" placeholder="Enter room code" value={room} onChange={e => setRoom(e.target.value.toUpperCase())} maxLength={4} style={{ padding:'8px', borderRadius:'4px', border:'1px solid #ccc' }} />
-          <button style={buttonStyle} onClick={startReceive}>Start Receiving</button>
-        </div>
-      )}
+      </div>
     </div>
   );
 }
-
-const buttonStyle = {
-  padding: '10px 20px',
-  border: 'none',
-  borderRadius: '4px',
-  backgroundColor: '#4a90e2',
-  color: '#fff',
-  cursor: 'pointer'
-};
